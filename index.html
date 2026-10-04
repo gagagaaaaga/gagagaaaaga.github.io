@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="How a Python simulator uses multiple servers, zones, load balancers, retries, circuit breakers and autoscaling to cut outages.">
+<title>Outage Resilience Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column like a runbook; each layer is a step with its text and code on the left and its measured result on the right. */
+:root {
+  --bg: #f2f4f3;
+  --surface: #fcfcfb;
+  --ink: #101518;
+  --ink-2: #4b5359;
+  --muted: #737c82;
+  --rule: #dde2e0;
+  --axis: #b9c0bd;
+  --series: #2a78d6;
+  --series-wash: rgba(42, 120, 214, 0.10);
+  --band: rgba(16, 21, 24, 0.055);
+  --code-bg: #e9edeb;
+  --code-comment: #6b7479;
+  --good: #0ca30c;
+  --warn: #fab219;
+  --crit: #d03b3b;
+  --ring: rgba(16, 21, 24, 0.10);
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1113; --surface: #161a1d; --ink: #eef1f2; --ink-2: #b4bcc1; --muted: #8b949a;
+    --rule: #262c30; --axis: #3a4247; --series: #3987e5; --series-wash: rgba(57, 135, 229, 0.15);
+    --band: rgba(255, 255, 255, 0.06); --code-bg: #1c2125; --code-comment: #8b949a;
+    --ring: rgba(255, 255, 255, 0.10); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1113; --surface: #161a1d; --ink: #eef1f2; --ink-2: #b4bcc1; --muted: #8b949a;
+  --rule: #262c30; --axis: #3a4247; --series: #3987e5; --series-wash: rgba(57, 135, 229, 0.15);
+  --band: rgba(255, 255, 255, 0.06); --code-bg: #1c2125; --code-comment: #8b949a;
+  --ring: rgba(255, 255, 255, 0.10); color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 400 16px/1.6 var(--body);
+  padding: 0 20px; padding-block: 48px 80px;
+}
+.wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 72px; }
+h1, h2, h3 { font-family: var(--display); font-stretch: 112%; text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.05; font-weight: 750; }
+h2 { font-size: clamp(1.45rem, 3vw, 1.9rem); line-height: 1.15; font-weight: 700; }
+h3 { font-size: 1.25rem; line-height: 1.2; font-weight: 700; }
+p { margin: 0; max-width: 65ch; }
+a { color: var(--series); text-underline-offset: 3px; }
+a:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--series); outline-offset: 3px; border-radius: 4px; }
+code { font-family: var(--mono); font-size: 0.88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.eyebrow { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.lead { font-size: 1.12rem; color: var(--ink-2); }
+section { display: grid; gap: 20px; }
+.section-head { display: grid; gap: 10px; }
+
+/* Hero */
+.hero { display: grid; gap: 22px; }
+.hero-figs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px 28px; margin-top: 8px; }
+.fig { display: grid; gap: 4px; }
+.fig-val { font: 700 clamp(2.6rem, 7vw, 4.2rem)/1 var(--display); font-stretch: 105%; letter-spacing: -0.02em; }
+.fig-lab { color: var(--ink-2); font-size: 0.92rem; }
+.fig-arrow { font: 500 2rem/1 var(--display); color: var(--muted); padding-bottom: 28px; }
+
+/* Stress test list */
+.stress { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
+.stress div { background: var(--surface); padding: 16px 18px; display: grid; gap: 4px; align-content: start; }
+.stress dt { font-weight: 600; }
+.stress dd { margin: 0; color: var(--ink-2); font-size: 0.93rem; }
+.stress .when { font: 500 0.78rem/1.3 var(--mono); color: var(--muted); }
+
+/* Status pill (status-page vocabulary) */
+.pill { display: inline-flex; align-items: center; gap: 7px; font: 500 0.8rem/1 var(--body); color: var(--ink); background: var(--surface); border: 1px solid var(--rule); padding: 6px 10px; border-radius: 999px; white-space: nowrap; }
+.pill i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.pill[data-s="good"] i { background: var(--good); }
+.pill[data-s="warn"] i { background: var(--warn); }
+.pill[data-s="crit"] i { background: var(--crit); }
+
+/* Bars */
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: grid; gap: 16px; min-width: 0; }
+.panel-title { font-weight: 600; }
+.panel-sub { color: var(--muted); font-size: 0.88rem; }
+.bars { display: grid; gap: 10px; }
+.bar-row { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); align-items: center; gap: 4px 16px; border-radius: 6px; }
+.bar-name { font-size: 0.93rem; }
+.bar-track { position: relative; height: 26px; margin-right: 64px;
+  background-image: linear-gradient(to right, var(--rule) 1px, transparent 1px);
+  background-size: calc(100% / 3) 100%; border-right: 1px solid var(--rule); }
+.bar { position: absolute; left: 0; top: 4px; height: 18px; background: var(--series); border-radius: 0 4px 4px 0; min-width: 2px; }
+.bar-val { position: absolute; top: 3px; font: 500 0.82rem/20px var(--mono); color: var(--ink); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.bar-row:hover .bar, .bar-row:focus-visible .bar { filter: brightness(1.12); }
+.bar-axis { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: 16px; }
+.bar-ticks { position: relative; height: 16px; margin-right: 64px; font: 400 0.75rem/16px var(--mono); color: var(--muted); }
+.bar-ticks span { position: absolute; transform: translateX(-50%); }
+.bar-ticks span:first-child { transform: none; }
+
+/* Table */
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; min-width: 640px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+th { font: 500 0.75rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:last-child td { border-bottom: none; }
+
+/* Steps */
+.key { display: flex; flex-wrap: wrap; gap: 8px 22px; color: var(--ink-2); font-size: 0.88rem; }
+.key span { display: inline-flex; align-items: center; gap: 8px; }
+.key .k-line { width: 18px; height: 2px; background: var(--series); }
+.key .k-band { width: 18px; height: 12px; background: var(--band); border: 1px solid var(--rule); }
+.key .k-tick { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 7px solid var(--muted); }
+.steps { display: grid; gap: 22px; }
+.step { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 24px; display: grid; gap: 18px; min-width: 0; }
+.step-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.step-no { font: 500 0.78rem/1 var(--mono); color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase; }
+.step-head .pill { margin-left: auto; }
+.step-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; }
+.step-text { display: grid; gap: 14px; align-content: start; min-width: 0; }
+.step-text p { color: var(--ink-2); }
+.step-text p strong { color: var(--ink); font-weight: 600; }
+.step-fig { margin: 0; display: grid; gap: 14px; align-content: start; min-width: 0; }
+.chart { width: 100%; min-width: 0; position: relative; }
+.chart svg { display: block; overflow: visible; }
+.chart-label { font-size: 0.82rem; color: var(--muted); }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+.stats div { background: var(--surface); padding: 10px 12px; display: grid; gap: 2px; }
+.stats b { font: 600 1.15rem/1.2 var(--body); }
+.stats span { font-size: 0.78rem; color: var(--muted); }
+.stats em { font-style: normal; font-size: 0.78rem; color: var(--ink-2); }
+pre { margin: 0; background: var(--code-bg); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font: 400 0.8rem/1.55 var(--mono); color: var(--ink); }
+pre code { background: none; padding: 0; font-size: inherit; border-radius: 0; }
+pre .c { color: var(--code-comment); }
+.file { font: 500 0.75rem/1 var(--mono); color: var(--muted); margin-bottom: -8px; }
+
+/* Architecture */
+.arch { display: grid; gap: 0; justify-items: center; background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 24px 18px; overflow-x: auto; }
+.node { border: 1px solid var(--axis); background: var(--bg); border-radius: 8px; padding: 10px 14px; text-align: center; display: grid; gap: 2px; }
+.node b { font-weight: 600; font-size: 0.95rem; }
+.node small { color: var(--muted); font-size: 0.8rem; }
+.vline { width: 1px; height: 22px; background: var(--axis); }
+.zones { display: grid; grid-template-columns: repeat(3, minmax(170px, 1fr)); gap: 12px; width: 100%; min-width: 540px; position: relative; padding-top: 22px; }
+.zones::before { content: ""; position: absolute; top: 0; left: 16.66%; right: 16.66%; height: 1px; background: var(--axis); }
+.zone { position: relative; border: 1px dashed var(--axis); border-radius: 10px; padding: 12px; display: grid; gap: 10px; justify-items: center; }
+.zone::before { content: ""; position: absolute; top: -22px; left: 50%; width: 1px; height: 22px; background: var(--axis); }
+.zone-name { font: 500 0.75rem/1 var(--mono); color: var(--muted); letter-spacing: 0.05em; justify-self: start; }
+.zone .node { width: 100%; }
+.srvs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.srv { font: 500 0.72rem/1 var(--mono); border: 1px solid var(--axis); border-radius: 5px; padding: 6px 7px; background: var(--surface); }
+.srv.boot { border-style: dashed; color: var(--muted); }
+.auto { width: 100%; min-width: 540px; margin-top: 14px; border: 1px solid var(--series); border-radius: 8px; padding: 10px 14px; display: grid; gap: 2px; text-align: center; }
+.auto b { font-weight: 600; font-size: 0.95rem; }
+.auto small { color: var(--ink-2); font-size: 0.82rem; }
+
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 22px; }
+.note { display: grid; gap: 8px; }
+.note h3 { font-size: 1.05rem; }
+.note p, .note li { color: var(--ink-2); font-size: 0.95rem; }
+.note ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 6px; }
+
+/* Tooltip */
+#tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule); box-shadow: 0 6px 18px rgba(0,0,0,0.12); border-radius: 8px; padding: 9px 11px; font-size: 0.82rem; display: grid; gap: 4px; min-width: 150px; }
+#tip .t-title { color: var(--muted); font: 500 0.74rem/1.2 var(--mono); }
+#tip .t-row { display: flex; align-items: center; gap: 8px; }
+#tip .t-row i { width: 12px; height: 2px; background: var(--series); flex: none; }
+#tip .t-row b { font-weight: 600; font-variant-numeric: tabular-nums; }
+#tip .t-row span { color: var(--ink-2); }
+
+@media (max-width: 820px) {
+  .step-body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 560px) {
+  body { padding: 0 16px; padding-block: 32px 64px; }
+  .wrap { gap: 56px; }
+  .bar-row, .bar-axis { grid-template-columns: minmax(0, 1fr); }
+  .bar-axis > :first-child { display: none; }
+  .step, .panel { padding: 16px; }
+  .step-head .pill { margin-left: 0; }
+  .stats b { font-size: 1rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .bar { transition: filter 0.15s; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="eyebrow">resilience/ · Python simulator</span>
+  <h1>How six layers took a service from 71.9% to 99.89% uptime</h1>
+  <p class="lead">The <code>resilience</code> package runs one deliberately brutal 20-minute stress test against six setups. Each setup adds one idea to the last: more servers, more zones, more load balancers, smarter retries, and finally a system that repairs itself. Every number on this page comes from that code, averaged over 20 runs.</p>
+  <div class="hero-figs">
+    <div class="fig"><span class="fig-val">355 s</span><span class="fig-lab">of downtime with 1 big server</span></div>
+    <span class="fig-arrow" aria-hidden="true">→</span>
+    <div class="fig"><span class="fig-val">4 s</span><span class="fig-lab">with the full multi-zone stack</span></div>
+  </div>
+</header>
+
+<section aria-labelledby="h-test">
+  <div class="section-head">
+    <span class="eyebrow">The stress test</span>
+    <h2 id="h-test">Every setup lives through the same bad 20 minutes</h2>
+    <p>Traffic runs at 60 requests per second, 90,000 requests per run. A second counts as downtime when more than 10% of its requests fail. Total capacity starts at 180 requests per second in every setup, so the differences come from how that capacity is arranged, not how much of it there is.</p>
+  </div>
+  <dl class="stress">
+    <div><span class="when">all run long · 0.15% per server per second</span><dt>Server crashes</dt><dd>A process dies. Without automation, the on-call engineer restarts it 90 seconds later.</dd></div>
+    <div><span class="when">all run long · 0.06% per server per second</span><dt>Gray failures</dt><dd>A server stays up and passes health checks but fails 60% of real requests. A human takes 150 seconds to notice.</dd></div>
+    <div><span class="when">t = 403 s · lasts 150 s</span><dt>Zone outage</dt><dd>zone-a loses power. Every server and load balancer inside it goes dark.</dd></div>
+    <div><span class="when">t = 800 s · lasts 150 s</span><dt>Traffic spike</dt><dd>Demand triples to 180 requests per second, exactly the starting capacity.</dd></div>
+  </dl>
+</section>
+
+<section aria-labelledby="h-results">
+  <div class="section-head">
+    <span class="eyebrow">Results</span>
+    <h2 id="h-results">Failed requests fall at every layer</h2>
+  </div>
+  <div class="panel">
+    <div>
+      <div class="panel-title">Failed requests per run</div>
+      <div class="panel-sub">Out of 90,000 requests, averaged over 20 runs. Hover or focus a row for detail.</div>
+    </div>
+    <div class="bars" id="bars"></div>
+    <div class="bar-axis" aria-hidden="true"><span></span><div class="bar-ticks"><span style="left:0">0</span><span style="left:33.333%">10k</span><span style="left:66.667%">20k</span><span style="left:100%">30k</span></div></div>
+  </div>
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Setup</th><th>Status</th><th class="num">Requests served</th><th class="num">Downtime</th><th class="num">Failed requests</th><th>Biggest cause</th></tr></thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="h-steps">
+  <div class="section-head">
+    <span class="eyebrow">Layer by layer</span>
+    <h2 id="h-steps">What each layer fixes, and what it leaves broken</h2>
+    <p>Each chart shows one run of the stress test: the share of requests served in each 10-second window.</p>
+    <div class="key"><span><i class="k-line"></i>Requests served</span><span><i class="k-band"></i>Zone outage or traffic spike</span><span><i class="k-tick"></i>A server crashed or started gray-failing</span></div>
+  </div>
+
+  <div class="steps">
+
+  <article class="step" data-scn="single">
+    <div class="step-head"><span class="step-no">Step 1</span><h3>1 big server</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>One machine handles all 180 requests per second behind one load balancer. <strong>Every crash is a full outage</strong> until a human restarts the server, and the zone outage takes everything down too.</p>
+        <p>The biggest cause of failure is "no healthy server": the time spent waiting for the on-call engineer.</p>
+        <div class="file">chaos.py · Operator</div>
+<pre><code><span class="c"># The on-call engineer: gets paged, investigates, restarts the box.</span>
+if (server.state == CRASHED and waited >= self.crash_repair_time) or \
+        (server.error_rate and waited >= self.gray_repair_time):
+    server.repair()      <span class="c"># 90 s for a crash, 150 s for a gray failure</span></code></pre>
+      </div>
+      <figure class="step-fig"><div class="chart" data-series="timeline"></div><div class="stats"></div></figure>
+    </div>
+  </article>
+
+  <article class="step" data-scn="one_zone">
+    <div class="step-head"><span class="step-no">Step 2</span><h3>6 servers, 1 zone</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>The same capacity split into six servers of 30 requests per second. A crash now removes a sixth of the capacity instead of all of it, and <strong>failed requests drop by a third</strong>. Health checks pull a dead server out of rotation after two failed pings.</p>
+        <p>Downtime got worse, though, from 355 to 437 seconds. Six machines break six times as often, and nothing retries a failed request, so every crash leaks errors to users for the few seconds before health checks notice. The zone outage still takes everything, because all six servers sit in one building.</p>
+        <div class="file">health.py · HealthChecker.run</div>
+<pre><code>for server, healthy in self._healthy.items():
+    ok = server.ping()
+    if ok == healthy:
+        self._streak[server] = 0
+        continue
+    self._streak[server] += 1
+    <span class="c"># 2 failed pings in a row to remove, 2 good ones to re-add</span>
+    threshold = self.healthy_threshold if ok else self.unhealthy_threshold
+    if self._streak[server] >= threshold:
+        self._healthy[server] = ok</code></pre>
+      </div>
+      <figure class="step-fig"><div class="chart" data-series="timeline"></div><div class="stats"></div></figure>
+    </div>
+  </article>
+
+  <article class="step" data-scn="multi_zone">
+    <div class="step-head"><span class="step-no">Step 3</span><h3>6 servers across 3 zones</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>Two servers in each of three zones. When zone-a loses power, four servers in zone-b and zone-c keep running. <strong>Users still get nothing</strong>, because the only load balancer lives in zone-a.</p>
+        <p>Exactly 9,000 requests are lost to "load balancer down": 150 seconds at 60 requests per second. Spreading servers is not enough when the load balancer is itself a single point of failure.</p>
+        <div class="file">infrastructure.py · load_balancer.py</div>
+<pre><code>@property
+def available(self):                     <span class="c"># Server</span>
+    return self.state == RUNNING and self.zone.up
+
+@property
+def available(self):                     <span class="c"># LoadBalancer</span>
+    <span class="c"># A load balancer is a machine too: it goes down with its zone.</span>
+    return self.zone.up</code></pre>
+      </div>
+      <figure class="step-fig"><div class="chart" data-series="timeline"></div><div class="stats"></div></figure>
+    </div>
+  </article>
+
+  <article class="step" data-scn="multi_lb">
+    <div class="step-head"><span class="step-no">Step 4</span><h3>A load balancer in every zone</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>Each zone gets its own load balancer, and DNS hands clients the address of every healthy one. When zone-a fails, DNS drops its balancer within the 5-second TTL. <strong>Zone-outage losses fall from 9,000 requests to 40.</strong></p>
+        <p>Each balancer prefers servers in its own zone and spills over to other zones when local ones are full or down. What is left: errors from crashes before health checks catch them, and gray failures, which health checks never catch because the server still answers pings.</p>
+        <div class="file">load_balancer.py · DnsFrontend</div>
+<pre><code>def tick(self, now):
+    if now % self.ttl == 0:              <span class="c"># clients re-resolve every TTL</span>
+        healthy = [lb for lb in self.balancers if lb.available]
+        self.answer = healthy or list(self.balancers)
+
+def route(self, now):
+    self._rr = (self._rr + 1) % len(self.answer)
+    lb = self.answer[self._rr]
+    if not lb.available:                 <span class="c"># cached answer, dead balancer</span>
+        return "load balancer down"
+    return lb.route(now)</code></pre>
+      </div>
+      <figure class="step-fig"><div class="chart" data-series="timeline"></div><div class="stats"></div></figure>
+    </div>
+  </article>
+
+  <article class="step" data-scn="breakers">
+    <div class="step-head"><span class="step-no">Step 5</span><h3>Retries and circuit breakers</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>When a request fails, the load balancer retries it on up to two other servers. A circuit breaker watches each server's real requests: three failures in a row and the server gets no traffic for 10 seconds, then one trial request decides whether it comes back.</p>
+        <p><strong>Server errors drop from 4,945 to zero</strong> and downtime falls from 343 to 107 seconds. The remaining failures are all overload during the traffic spike: demand equals the starting capacity, so any broken or isolated server leaves too little room.</p>
+        <div class="file">load_balancer.py · LoadBalancer.route</div>
+<pre><code>for attempt in range(1 + self.retries):
+    candidates = self._candidates(now, tried)  <span class="c"># healthy, breaker closed</span>
+    if not candidates:
+        break
+    server = self._pick(candidates)
+    tried.add(server)
+    try:
+        server.handle(self.rng)
+    except Overloaded:
+        reason = "overloaded"            <span class="c"># shed load, server isn't broken</span>
+        continue
+    except ServerError:
+        reason = "server error"
+        if breaker:
+            breaker.record_failure(now)  <span class="c"># 3 in a row opens it</span>
+        continue
+    return None                          <span class="c"># served</span></code></pre>
+      </div>
+      <figure class="step-fig"><div class="chart" data-series="timeline"></div><div class="stats"></div></figure>
+    </div>
+  </article>
+
+  <article class="step" data-scn="autoscale">
+    <div class="step-head"><span class="step-no">Step 6</span><h3>A self-healing autoscaler</h3><span class="pill"></span></div>
+    <div class="step-body">
+      <div class="step-text">
+        <p>Every 5 seconds the autoscaler replaces crashed servers and servers the circuit breakers flagged, keeps at least two servers in every healthy zone, launches extra servers in the surviving zones during the outage, and adds servers ahead of the traffic spike. New servers take 8 seconds to boot and must pass health checks before they get traffic.</p>
+        <p><strong>Failed requests fall from 4,490 to 102, and downtime from 107 seconds to 4.</strong> The lower chart shows the server count following the load: it dips when zone-a goes dark, refills in the other zones, and climbs to 10 for the spike.</p>
+        <div class="file">autoscaler.py · Autoscaler.step</div>
+<pre><code><span class="c"># 1. Self-heal. A server in a failed zone isn't broken itself, so it stays.</span>
+for server in list(cluster.servers):
+    if server.state == CRASHED or (server in suspects and server.zone.up):
+        cluster.terminate(server)
+
+<span class="c"># 2. Every healthy zone keeps a minimum footprint.</span>
+for zone in healthy_zones:
+    for _ in range(self.min_per_zone - len(self._usable(zone))):
+        self._launch(zone, now)
+
+<span class="c"># 3. Scale out to meet demand, filling the emptiest zone first.</span>
+if usable &lt; want:
+    for _ in range(min(want - usable, self.max_launch)):
+        zone = min(healthy_zones, key=lambda z: len(self._usable(z)))
+        self._launch(zone, now)</code></pre>
+      </div>
+      <figure class="step-fig">
+        <div class="chart" data-series="timeline"></div>
+        <div class="chart-label">Servers serving traffic</div>
+        <div class="chart" data-series="servers_timeline" data-h="120"></div>
+        <div class="stats"></div>
+      </figure>
+    </div>
+  </article>
+
+  </div>
+</section>
+
+<section aria-labelledby="h-arch">
+  <div class="section-head">
+    <span class="eyebrow">The final setup</span>
+    <h2 id="h-arch">No single point of failure left in the request path</h2>
+    <p>Users reach any healthy load balancer through DNS, any balancer can reach any server, and the autoscaler keeps every zone stocked.</p>
+  </div>
+  <div class="arch" role="img" aria-label="Users connect through DNS to three load balancers, one in each of zone-a, zone-b and zone-c. Each zone holds two or more servers. An autoscaler spans all three zones.">
+    <div class="node"><b>Users</b><small>60 to 180 requests per second</small></div>
+    <div class="vline"></div>
+    <div class="node"><b>DNS</b><small>returns every healthy load balancer · 5 s TTL</small></div>
+    <div class="zones">
+      <div class="zone"><span class="zone-name">zone-a</span><div class="node"><b>Load balancer</b><small>health checks · breakers · 2 retries</small></div><div class="srvs"><span class="srv">srv</span><span class="srv">srv</span><span class="srv boot">boot</span></div></div>
+      <div class="zone"><span class="zone-name">zone-b</span><div class="node"><b>Load balancer</b><small>health checks · breakers · 2 retries</small></div><div class="srvs"><span class="srv">srv</span><span class="srv">srv</span></div></div>
+      <div class="zone"><span class="zone-name">zone-c</span><div class="node"><b>Load balancer</b><small>health checks · breakers · 2 retries</small></div><div class="srvs"><span class="srv">srv</span><span class="srv">srv</span></div></div>
+    </div>
+    <div class="auto"><b>Autoscaler</b><small>every 5 s: replace broken servers · 2+ per healthy zone · scale with traffic · new servers boot in 8 s</small></div>
+  </div>
+
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Failure</th><th>What catches it</th><th>How fast</th></tr></thead>
+        <tbody>
+          <tr><td>Server crash</td><td>Retry sends the request to another server; health checks remove the server; the autoscaler replaces it</td><td>Instant · 2–4 s · within 5 s, plus 8 s boot</td></tr>
+          <tr><td>Gray failure</td><td>Circuit breaker isolates the server; the autoscaler replaces it</td><td>After 3 failed requests · within 5 s</td></tr>
+          <tr><td>Zone outage</td><td>DNS stops sending users to that zone's load balancer; the other balancers use servers in the surviving zones; the autoscaler adds servers there</td><td>Within the 5 s TTL</td></tr>
+          <tr><td>Load balancer failure</td><td>DNS sends users to the other balancers</td><td>Within the 5 s TTL</td></tr>
+          <tr><td>Traffic spike</td><td>Servers reject excess requests instead of falling over; the autoscaler adds servers</td><td>Instant · within 5 s, plus 8 s boot</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="h-run">
+  <div class="section-head">
+    <span class="eyebrow">Use it</span>
+    <h2 id="h-run">Run it yourself</h2>
+    <p>Standard-library Python 3.8+, nothing to install. The source code lives in the <code>resilience/</code> package of the project repository.</p>
+  </div>
+<pre><code>python -m resilience                  <span class="c"># comparison table, 5 runs</span>
+python -m resilience --seeds 20       <span class="c"># the numbers on this page</span>
+python -m resilience --json out.json  <span class="c"># full results and timelines</span>
+python -m unittest discover -s tests  <span class="c"># 15 tests</span></code></pre>
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Module</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>infrastructure.py</code></td><td>Zones and servers, and the ways a request can fail</td></tr>
+          <tr><td><code>health.py</code></td><td>Health checks and circuit breakers</td></tr>
+          <tr><td><code>load_balancer.py</code></td><td>Load balancing, retries, and DNS failover between balancers</td></tr>
+          <tr><td><code>autoscaler.py</code></td><td>Self-healing, scaling with traffic, keeping servers spread across zones</td></tr>
+          <tr><td><code>chaos.py</code></td><td>Failure injection and the slow human fix</td></tr>
+          <tr><td><code>simulation.py</code></td><td>The six setups, the stress test, and the measurements</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="note">
+      <h3>Change the experiment</h3>
+      <ul>
+        <li>Edit <code>SCENARIOS</code> in <code>simulation.py</code> to try other layouts, such as 4 zones or 3 retries.</li>
+        <li>Raise <code>crash_rate</code> or <code>gray_rate</code> in <code>chaos.py</code> to make the day worse.</li>
+        <li>Change <code>ttl</code> on <code>DnsFrontend</code> to see how DNS caching delays failover.</li>
+      </ul>
+    </div>
+    <div class="note">
+      <h3>What the model leaves out</h3>
+      <ul>
+        <li>The failure rates are made up and compressed: real servers fail far less often than every few minutes.</li>
+        <li>Databases and other shared state become the next single point of failure once servers are redundant.</li>
+        <li>A bad deploy can break every server at once. Canary releases are the usual defense.</li>
+        <li>All three zones sit in one region. Surviving a regional outage needs a second region.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</div>
+<div id="tip" hidden></div>
+
+<script>
+const DATA = [{"key":"single","name":"1 big server","availability":0.71892,"downtime_s":354.75,"failed_requests":25296.85,"failures":{"server error":2535.8,"no healthy server":13761.0,"load balancer down":9000.0},"saved_by_retry":0.0,"auto_replaced":0.0,"timeline":[1.0,1.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.8,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.7883,0.4167,0.385,0.415,0.405,0.385,0.3933,0.4183,0.4017,0.4,0.4233,0.3967,0.395,0.12,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.4,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.8,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.4,0.3833,0.4117,0.445,0.4367,0.4317,0.4183,0.385,0.4067,0.3983,0.385,0.38,0.4267,0.4117,0.41,1.0],"servers_timeline":[1,1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"events":[[40,"crash"],[276,"gray failure"],[403,"zone down"],[553,"zone up"],[769,"crash"],[1040,"gray failure"]]},{"key":"one_zone","name":"6 servers, 1 zone","availability":0.8099,"downtime_s":436.55,"failed_requests":17108.8,"failures":{"server error":4813.3,"load balancer down":9000.0,"no healthy server":180.0,"overloaded":3115.5},"saved_by_retry":0.0,"auto_replaced":0.0,"timeline":[0.8133,1.0,1.0,0.9517,0.8917,0.8867,0.87,0.885,0.8067,0.705,0.8817,0.875,0.8767,0.8367,0.75,0.7683,0.77,0.7567,0.84,0.9117,0.8917,0.8967,0.8933,0.6367,0.8767,0.8883,0.8717,0.89,0.9217,1.0,1.0,1.0,1.0,1.0,1.0,0.705,1.0,1.0,1.0,1.0,0.3,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.4,1.0,1.0,0.8033,1.0,1.0,1.0,0.8,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.725,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.8333,1.0,0.9006,0.6678,0.8333,0.8333,0.8333,0.8333,0.8333,0.8333,0.8333,0.8333,0.9667,1.0,1.0,0.935,0.895,0.875,0.8067,0.825,0.8033,0.7717,0.815,0.7983,0.7933,0.815,0.7983,0.8,0.8133,0.7983,0.8733,0.8883,0.9033,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"servers_timeline":[5,5,5,5,5,5,5,5,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,5,5,5,5,5,5,5,5,5,6,6,6,5,5,5,5,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,6,6,5,5,5,5,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"events":[[6,"crash"],[35,"gray failure"],[89,"crash"],[136,"gray failure"],[237,"crash"],[353,"crash"],[403,"zone down"],[553,"zone up"],[582,"crash"],[622,"crash"],[717,"crash"],[829,"crash"],[954,"gray failure"],[978,"gray failure"]]},{"key":"multi_zone","name":"6 servers across 3 zones","availability":0.81931,"downtime_s":435.6,"failed_requests":16261.7,"failures":{"server error":4740.2,"load balancer down":9000.0,"overloaded":2521.5},"saved_by_retry":0.0,"auto_replaced":0.0,"timeline":[0.8133,1.0,1.0,0.9517,0.8917,0.8867,0.87,0.885,0.8067,0.705,0.8817,0.875,0.8767,0.8367,0.75,0.7683,0.77,0.7567,0.84,0.9117,0.8917,0.8967,0.8933,0.6367,0.8767,0.8883,0.8717,0.89,0.9217,1.0,1.0,1.0,1.0,1.0,1.0,0.705,1.0,1.0,1.0,1.0,0.3,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.7,1.0,1.0,1.0,1.0,1.0,0.725,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9017,0.8033,1.0,1.0,1.0,1.0,1.0,1.0,0.8333,0.8333,0.9667,1.0,1.0,0.9372,0.9,0.8883,0.795,0.805,0.8039,0.7989,0.7933,0.81,0.79,0.8017,0.7933,0.805,0.82,0.7967,0.8683,0.9083,0.935,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.985,0.9067,0.915,0.9017,0.9083,0.9133,0.8917,0.9017,0.91,0.9117],"servers_timeline":[5,5,5,5,5,5,5,5,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,5,5,5,5,5,5,5,5,5,6,6,6,5,5,5,5,5,4,4,4,4,3,3,3,3,3,3,3,2,2,3,3,5,5,5,5,5,6,5,5,5,5,5,5,5,5,5,6,6,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"events":[[6,"crash"],[35,"gray failure"],[89,"crash"],[136,"gray failure"],[237,"crash"],[353,"crash"],[403,"zone down"],[446,"crash"],[512,"crash"],[553,"zone up"],[617,"crash"],[729,"crash"],[854,"gray failure"],[878,"gray failure"],[1109,"gray failure"]]},{"key":"multi_lb","name":"+ load balancer in every zone","availability":0.9166,"downtime_s":343.0,"failed_requests":7506.05,"failures":{"server error":4944.6,"load balancer down":40.0,"overloaded":2521.5},"saved_by_retry":0.0,"auto_replaced":0.0,"timeline":[0.9333,1.0,1.0,0.9133,0.8167,0.7967,0.815,0.8067,0.7583,0.7583,0.8933,0.9,0.8983,0.8617,0.82,0.79,0.805,0.805,0.8433,0.895,0.895,0.9033,0.91,0.79,0.895,0.9133,0.8983,0.8883,0.94,1.0,1.0,1.0,1.0,1.0,1.0,0.905,1.0,1.0,1.0,1.0,0.9333,1.0,1.0,1.0,0.9033,1.0,1.0,1.0,1.0,1.0,1.0,0.9033,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.905,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9683,0.9367,1.0,1.0,1.0,1.0,1.0,1.0,0.8333,0.8333,0.9667,1.0,1.0,0.9378,0.9111,0.8744,0.8011,0.8017,0.8078,0.8,0.7967,0.8044,0.7906,0.7933,0.805,0.82,0.7967,0.8167,0.8717,0.905,0.9317,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9933,0.9017,0.9083,0.9133,0.8917,0.9017,0.91,0.9117,0.9067,0.905],"servers_timeline":[5,5,5,5,5,5,5,5,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,5,5,5,5,5,5,5,5,5,6,6,6,5,5,5,5,5,4,4,4,4,3,3,3,3,3,3,3,2,2,3,3,5,5,5,5,5,6,5,5,5,5,5,5,5,5,5,6,6,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"events":[[6,"crash"],[35,"gray failure"],[89,"crash"],[136,"gray failure"],[237,"crash"],[353,"crash"],[403,"zone down"],[446,"crash"],[512,"crash"],[553,"zone up"],[617,"crash"],[729,"crash"],[854,"gray failure"],[878,"gray failure"],[1109,"gray failure"]]},{"key":"breakers","name":"+ retries & circuit breakers","availability":0.95011,"downtime_s":107.45,"failed_requests":4489.8,"failures":{"load balancer down":40.0,"overloaded":4449.8},"saved_by_retry":205.6,"auto_replaced":0.0,"timeline":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9333,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.8333,0.8333,0.9667,1.0,1.0,0.9067,0.8372,0.8078,0.6706,0.6733,0.6678,0.6756,0.67,0.6706,0.6772,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"servers_timeline":[5,5,5,5,5,5,5,5,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,5,5,5,5,5,5,5,5,5,6,6,6,5,5,5,5,5,4,4,4,4,3,3,3,3,3,3,3,2,2,3,3,5,5,5,5,5,6,5,5,5,5,5,5,5,5,5,6,6,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6],"events":[[6,"crash"],[35,"gray failure"],[89,"crash"],[136,"gray failure"],[237,"crash"],[353,"crash"],[403,"zone down"],[446,"crash"],[512,"crash"],[553,"zone up"],[617,"crash"],[729,"crash"],[854,"gray failure"],[878,"gray failure"],[1109,"gray failure"]]},{"key":"autoscale","name":"+ self-healing autoscaler","availability":0.99887,"downtime_s":4.05,"failed_requests":101.5,"failures":{"load balancer down":40.0,"overloaded":61.4,"server error":0.1},"saved_by_retry":56.9,"auto_replaced":17.0,"timeline":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.9333,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"servers_timeline":[5,6,6,5,6,6,6,6,6,6,5,6,6,6,6,6,6,5,6,6,6,6,6,6,6,6,5,6,6,6,6,6,6,5,6,6,6,5,6,6,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,6,6,6,6,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,10,10,10,10,10,10,10,10,10,10,10,10,10,9,10,10,9,9,9,7,7,6,6,6,6,5,6,6,5,4,6,6,6,6,6,6,6,6,6],"events":[[6,"crash"],[33,"gray failure"],[70,"crash"],[102,"gray failure"],[172,"crash"],[266,"crash"],[339,"crash"],[374,"crash"],[403,"zone down"],[470,"crash"],[553,"zone up"],[595,"crash"],[707,"gray failure"],[729,"gray failure"],[875,"gray failure"],[944,"crash"],[1004,"gray failure"],[1024,"crash"],[1026,"gray failure"],[1068,"crash"],[1095,"crash"],[1102,"gray failure"],[1106,"crash"]]}];
+const DAY = 1200, BUCKET = 10;
+const BANDS = [[403, 553, "zone-a down"], [800, 950, "3× traffic"]];
+const byKey = Object.fromEntries(DATA.map(d => [d.key, d]));
+const fmtInt = n => Math.round(n).toLocaleString("en-US");
+const fmtPct = (a, d) => (a * 100).toFixed(d) + "%";
+const STATUS = a => a >= 0.995 ? ["good", "Operational"] : a >= 0.9 ? ["warn", "Partial outage"] : ["crit", "Major outage"];
+const CAUSE = { "no healthy server": "No healthy server", "load balancer down": "Load balancer down", "server error": "Server errors", "overloaded": "Overload" };
+const topCause = d => { const e = Object.entries(d.failures); return e.length ? CAUSE[e.sort((a, b) => b[1] - a[1])[0][0]] : "None"; };
+
+/* Tooltip ---------------------------------------------------------------- */
+const tip = document.getElementById("tip");
+function showTip(x, y, title, rows) {
+  tip.replaceChildren();
+  const t = document.createElement("div"); t.className = "t-title"; t.textContent = title; tip.append(t);
+  for (const [val, lab, key] of rows) {
+    const r = document.createElement("div"); r.className = "t-row";
+    if (key) { const i = document.createElement("i"); r.append(i); }
+    const b = document.createElement("b"); b.textContent = val;
+    const s = document.createElement("span"); s.textContent = lab;
+    r.append(b, s); tip.append(r);
+  }
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let left = x + 14, top = y - h - 12;
+  if (left + w > window.innerWidth - 8) left = x - w - 14;
+  if (left < 8) left = 8;
+  if (top < 8) top = y + 16;
+  tip.style.left = left + "px"; tip.style.top = top + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+
+/* Status pills, stats, table, bars --------------------------------------- */
+function pill(el, d) {
+  const [s, label] = STATUS(d.availability);
+  el.dataset.s = s;
+  el.replaceChildren();
+  const i = document.createElement("i"); el.append(i, document.createTextNode(label));
+}
+
+const tbody = document.getElementById("results-body");
+DATA.forEach(d => {
+  const tr = document.createElement("tr");
+  const cells = [d.name, null, fmtPct(d.availability, 2), fmtInt(d.downtime_s) + " s", fmtInt(d.failed_requests), topCause(d)];
+  cells.forEach((c, i) => {
+    const td = document.createElement("td");
+    if (i >= 2 && i <= 4) td.className = "num";
+    if (i === 1) { const p = document.createElement("span"); p.className = "pill"; pill(p, d); td.append(p); }
+    else td.textContent = c;
+    tr.append(td);
+  });
+  tbody.append(tr);
+});
+
+const bars = document.getElementById("bars");
+const BAR_MAX = 30000;
+DATA.forEach(d => {
+  const row = document.createElement("div"); row.className = "bar-row"; row.tabIndex = 0;
+  row.setAttribute("aria-label", `${d.name}: ${fmtInt(d.failed_requests)} failed requests, ${fmtPct(d.availability, 2)} served`);
+  const name = document.createElement("span"); name.className = "bar-name"; name.textContent = d.name;
+  const track = document.createElement("div"); track.className = "bar-track";
+  const w = d.failed_requests / BAR_MAX * 100;
+  const bar = document.createElement("div"); bar.className = "bar"; bar.style.width = w + "%";
+  const val = document.createElement("span"); val.className = "bar-val"; val.style.left = `calc(${w}% + 6px)`; val.textContent = fmtInt(d.failed_requests);
+  track.append(bar, val); row.append(name, track); bars.append(row);
+  const rows = () => [[fmtInt(d.failed_requests), "failed requests", true], [fmtPct(d.availability, 2), "served"], [fmtInt(d.downtime_s) + " s", "downtime"]];
+  row.addEventListener("pointermove", e => showTip(e.clientX, e.clientY, d.name, rows()));
+  row.addEventListener("pointerleave", hideTip);
+  row.addEventListener("focus", () => { const r = bar.getBoundingClientRect(); showTip(r.right, r.top, d.name, rows()); });
+  row.addEventListener("blur", hideTip);
+});
+
+/* Step cards -------------------------------------------------------------- */
+document.querySelectorAll(".step").forEach((step, idx) => {
+  const d = byKey[step.dataset.scn];
+  pill(step.querySelector(".pill"), d);
+  const prev = idx > 0 ? DATA[idx - 1] : null;
+  const stats = step.querySelector(".stats");
+  const items = [
+    [fmtPct(d.availability, d.availability > 0.99 ? 2 : 1), "requests served", prev ? (d.availability - prev.availability) * 100 : null, " pts", 1],
+    [fmtInt(d.downtime_s) + " s", "downtime", prev ? d.downtime_s - prev.downtime_s : null, " s", 0],
+    [fmtInt(d.failed_requests), "failed requests", prev ? d.failed_requests - prev.failed_requests : null, "", 0],
+  ];
+  for (const [v, lab, delta, unit, dp] of items) {
+    const box = document.createElement("div");
+    const b = document.createElement("b"); b.textContent = v;
+    const s = document.createElement("span"); s.textContent = lab;
+    box.append(b, s);
+    if (delta !== null) {
+      const em = document.createElement("em");
+      const n = dp ? Math.abs(delta).toFixed(dp) : fmtInt(Math.abs(delta));
+      em.textContent = (delta >= 0 ? "+" : "−") + n + unit + " vs step " + idx;
+      box.append(em);
+    }
+    stats.append(box);
+  }
+  step.querySelectorAll(".chart").forEach(el => lineChart(el, d, el.dataset.series));
+});
+
+/* Line chart -------------------------------------------------------------- */
+function lineChart(host, d, series) {
+  const values = d[series];
+  const isServers = series === "servers_timeline";
+  const yMax = isServers ? 12 : 1;
+  const yTicks = isServers ? [0, 6, 12] : [0, 0.5, 1];
+  const yFmt = v => isServers ? String(v) : Math.round(v * 100) + "%";
+  const failures = isServers ? [] : d.events.filter(e => e[1] === "crash" || e[1] === "gray failure");
+  const label = isServers
+    ? `Servers serving traffic over the 20-minute test for ${d.name}, between ${Math.min(...values)} and ${Math.max(...values)}.`
+    : `Share of requests served over the 20-minute test for ${d.name}. Lowest 10-second window: ${fmtPct(Math.min(...values), 0)}.`;
+  let active = null;
+
+  function draw() {
+    const W = Math.max(260, host.clientWidth), H = +(host.dataset.h || 150);
+    const m = { l: 38, r: 8, t: 26, b: 24 };
+    const iw = W - m.l - m.r, ih = H - m.t - m.b;
+    const x = t => m.l + t / DAY * iw;
+    const y = v => m.t + ih - v / yMax * ih;
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("role", "img"); svg.setAttribute("aria-label", label + " Use left and right arrow keys to read values.");
+    svg.setAttribute("tabindex", "0");
+    const el = (tag, attrs, text) => {
+      const n = document.createElementNS(NS, tag);
+      for (const k in attrs) {
+        const v = String(attrs[k]);
+        if (v.startsWith("var(")) n.style.setProperty(k, v); else n.setAttribute(k, v);
+      }
+      if (text != null) n.textContent = text;
+      svg.append(n); return n;
+    };
+    const txt = { fill: "var(--muted)", "font-size": 11, "font-family": "var(--mono)" };
+
+    for (const [a, b, lab] of BANDS) {
+      el("rect", { x: x(a), y: m.t, width: x(b) - x(a), height: ih, fill: "var(--band)" });
+      el("text", { ...txt, x: x(a) + 2, y: m.t - 14 }, lab);
+    }
+    for (const v of yTicks) {
+      el("line", { x1: m.l, x2: m.l + iw, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--rule)", "stroke-width": 1 });
+      el("text", { ...txt, x: m.l - 6, y: y(v) + 4, "text-anchor": "end" }, yFmt(v));
+    }
+    [[0, "0"], [300, "5 min"], [600, "10 min"], [900, "15 min"], [1200, "20 min"]].forEach(([t, lab], i, arr) => {
+      el("text", { ...txt, x: x(t), y: H - 6, "text-anchor": i === 0 ? "start" : i === arr.length - 1 ? "end" : "middle" }, lab);
+    });
+    for (const [t] of failures) {
+      el("path", { d: `M${x(t) - 3.5},${m.t - 7} L${x(t) + 3.5},${m.t - 7} L${x(t)},${m.t - 1} Z`, fill: "var(--muted)" });
+    }
+    const pts = values.map((v, i) => [x(i * BUCKET + BUCKET / 2), y(v)]);
+    const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join("");
+    el("path", { d: `${line}L${pts[pts.length - 1][0].toFixed(1)},${y(0)}L${pts[0][0].toFixed(1)},${y(0)}Z`, fill: "var(--series-wash)" });
+    el("path", { d: line, fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" });
+
+    const cross = el("line", { y1: m.t, y2: m.t + ih, stroke: "var(--ink-2)", "stroke-width": 1, visibility: "hidden" });
+    const dot = el("circle", { r: 4.5, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+    const hit = el("rect", { x: m.l, y: 0, width: iw, height: H, fill: "transparent" });
+
+    function set(i, cx, cy) {
+      active = i;
+      const [px, py] = pts[i];
+      cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+      dot.setAttribute("cx", px); dot.setAttribute("cy", py); dot.setAttribute("visibility", "visible");
+      const v = values[i];
+      const title = `${i * BUCKET}–${(i + 1) * BUCKET} s`;
+      const rows = isServers
+        ? [[String(v), "servers serving", true]]
+        : [[fmtPct(v, 1), "of requests served", true], [String(d.servers_timeline[i]), "servers serving"]];
+      if (cx == null) { const r = svg.getBoundingClientRect(); cx = r.left + px; cy = r.top + py; }
+      showTip(cx, cy, title, rows);
+    }
+    function clear() { active = null; cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); hideTip(); }
+    const idxAt = clientX => { const r = svg.getBoundingClientRect(); return Math.max(0, Math.min(values.length - 1, Math.floor((clientX - r.left - m.l) / iw * values.length))); };
+    hit.addEventListener("pointermove", e => set(idxAt(e.clientX), e.clientX, e.clientY));
+    hit.addEventListener("pointerleave", clear);
+    svg.addEventListener("focus", () => set(active ?? values.indexOf(Math.min(...values))));
+    svg.addEventListener("blur", clear);
+    svg.addEventListener("keydown", e => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      set(Math.max(0, Math.min(values.length - 1, (active ?? 0) + (e.key === "ArrowRight" ? 1 : -1))));
+    });
+    host.replaceChildren(svg);
+  }
+  draw();
+  let lastW = host.clientWidth;
+  new ResizeObserver(() => { if (host.clientWidth !== lastW) { lastW = host.clientWidth; draw(); } }).observe(host);
+}
+</script>
+</body>
+</html>
