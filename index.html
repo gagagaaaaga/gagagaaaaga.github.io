@@ -47,6 +47,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   background: var(--bg); color: var(--ink);
   font: 400 16px/1.6 var(--body);
@@ -168,6 +169,18 @@ pre .c { color: var(--code-comment); }
 .note p, .note li { color: var(--ink-2); font-size: 0.95rem; }
 .note ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 6px; }
 
+/* Security */
+.stress.six { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.sec-chips { display: flex; flex-wrap: wrap; gap: 5px; min-width: 14rem; }
+#security table { min-width: 820px; }
+.sec-chips .srv { display: inline-flex; align-items: center; gap: 4px; }
+.srv.broken { border-color: var(--crit); }
+.srv.held { border-color: var(--good); }
+.srv b { font-weight: 600; }
+.srv.broken b { color: var(--crit); }
+.srv.held b { color: var(--good); }
+td .pill { font-size: 0.78rem; }
+
 /* Tooltip */
 #tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule); box-shadow: 0 6px 18px rgba(0,0,0,0.12); border-radius: 8px; padding: 9px 11px; font-size: 0.82rem; display: grid; gap: 4px; min-width: 150px; }
 #tip .t-title { color: var(--muted); font: 500 0.74rem/1.2 var(--mono); }
@@ -199,7 +212,7 @@ pre .c { color: var(--code-comment); }
 <header class="hero">
   <span class="eyebrow">resilience/ · Python simulator</span>
   <h1>How six layers took a service from 71.9% to 99.89% uptime</h1>
-  <p class="lead">The <code>resilience</code> package runs one deliberately brutal 20-minute stress test against six setups. Each setup adds one idea to the last: more servers, more zones, more load balancers, smarter retries, and finally a system that repairs itself. Every number on this page comes from that code, averaged over 20 runs.</p>
+  <p class="lead">The <code>resilience</code> package runs one deliberately brutal 20-minute stress test against six setups. Each setup adds one idea to the last: more servers, more zones, more load balancers, smarter retries, and finally a system that repairs itself. A last section shows how each server's admin login stands up to password guessing. Every number on this page comes from that code, averaged over 20 runs.</p>
   <div class="hero-figs">
     <div class="fig"><span class="fig-val">355 s</span><span class="fig-lab">of downtime with 1 big server</span></div>
     <span class="fig-arrow" aria-hidden="true">→</span>
@@ -433,6 +446,62 @@ if usable &lt; want:
   </div>
 </section>
 
+<section aria-labelledby="h-sec" id="security">
+  <div class="section-head">
+    <span class="eyebrow">Security</span>
+    <h2 id="h-sec">Passwords that hold against a brute-force attack</h2>
+    <p>Redundancy keeps the service running when machines fail. An attacker is a different kind of failure: someone who guesses a server's admin password can take that server over, and a password shared across servers hands over all of them at once. <code>security.py</code> protects every server's admin login with six layers.</p>
+  </div>
+  <dl class="stress six">
+    <div><span class="when">every server, every launch</span><dt>Unique random passwords</dt><dd>24 characters from a cryptographically secure generator, different on every server, including the ones the autoscaler launches.</dd></div>
+    <div><span class="when">checked on every change</span><dt>Password policy</dt><dd>Rejects passwords under 12 characters, common passwords, and passwords that contain the username.</dd></div>
+    <div><span class="when">PBKDF2-SHA256 · 600,000 rounds</span><dt>Salted, slow hashing</dt><dd>Servers store only a hash, never the password. Every guess costs an attacker real computing time.</dd></div>
+    <div><span class="when">hmac.compare_digest</span><dt>Constant-time checks</dt><dd>A wrong guess takes as long as a right one, and unknown usernames take as long as real ones, so timing leaks nothing.</dd></div>
+    <div><span class="when">5 wrong guesses · 5 minutes</span><dt>Lockout</dt><dd>After 5 wrong guesses the account locks, refusing even the correct password until the lock expires.</dd></div>
+    <div><span class="when">rotate on demand</span><dt>Vault and audit log</dt><dd>The only copy of each password lives in a vault that can replace it at any time. Every login attempt is logged.</dd></div>
+  </dl>
+  <div class="panel">
+    <div>
+      <div class="panel-title">One hour of password guessing against 6 servers</div>
+      <div class="panel-sub" id="sec-sub">The same attack against each setup.</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Setup</th><th>Servers</th><th>Result</th><th>Time to break in</th><th class="num">Guesses</th><th class="num">Lockouts</th></tr></thead>
+        <tbody id="sec-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="note">
+      <div class="file">security.py · ServerAuth.login (abridged)</div>
+<pre><code>if self.is_locked(username, now):
+    raise AccountLocked(username, self._locked_until[username])
+
+ok = verify_password(password, self._hashes.get(username, self._dummy_hash))
+ok = ok and username in self._hashes   <span class="c"># unknown users cost the same</span>
+if ok:
+    self._failures[username] = 0
+    return True
+
+self._failures[username] = self._failures.get(username, 0) + 1
+if self._failures[username] >= self.max_attempts:          <span class="c"># 5 guesses</span>
+    self._locked_until[username] = now + self.lockout_seconds  <span class="c"># 5 min</span>
+return False</code></pre>
+    </div>
+    <div class="note">
+      <h3>Why lockout alone failed</h3>
+      <p><code>admin123</code> is the 8th guess on the attacker's list. Lockout only slowed the attack to 5 guesses every 5 minutes, so the weak password still fell after one lock expired. With random 24-character passwords, the attacker gets 60 guesses per server per hour against more than 10<sup>45</sup> possibilities.</p>
+      <h3>For real servers</h3>
+      <ul>
+        <li>Prefer SSH keys plus multi-factor authentication over passwords.</li>
+        <li>Keep passwords in a secrets manager, never in code or git.</li>
+        <li>Check new passwords against breach lists with millions of entries, not a short list.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
 <section aria-labelledby="h-run">
   <div class="section-head">
     <span class="eyebrow">Use it</span>
@@ -442,7 +511,8 @@ if usable &lt; want:
 <pre><code>python -m resilience                  <span class="c"># comparison table, 5 runs</span>
 python -m resilience --seeds 20       <span class="c"># the numbers on this page</span>
 python -m resilience --json out.json  <span class="c"># full results and timelines</span>
-python -m unittest discover -s tests  <span class="c"># 15 tests</span></code></pre>
+python -m resilience.security_demo   <span class="c"># password attack demo</span>
+python -m unittest discover -s tests  <span class="c"># 30 tests</span></code></pre>
   <div class="panel">
     <div class="table-wrap">
       <table>
@@ -452,6 +522,7 @@ python -m unittest discover -s tests  <span class="c"># 15 tests</span></code></
           <tr><td><code>health.py</code></td><td>Health checks and circuit breakers</td></tr>
           <tr><td><code>load_balancer.py</code></td><td>Load balancing, retries, and DNS failover between balancers</td></tr>
           <tr><td><code>autoscaler.py</code></td><td>Self-healing, scaling with traffic, keeping servers spread across zones</td></tr>
+          <tr><td><code>security.py</code></td><td>Admin passwords: policy, hashing, lockout, vault, audit log</td></tr>
           <tr><td><code>chaos.py</code></td><td>Failure injection and the slow human fix</td></tr>
           <tr><td><code>simulation.py</code></td><td>The six setups, the stress test, and the measurements</td></tr>
         </tbody>
@@ -554,6 +625,46 @@ DATA.forEach(d => {
   row.addEventListener("focus", () => { const r = bar.getBoundingClientRect(); showTip(r.right, r.top, d.name, rows()); });
   row.addEventListener("blur", hideTip);
 });
+
+/* Security ---------------------------------------------------------------- */
+const SECURITY = {"wordlist_size":130,"guesses_per_second":10,"setups":[{"key":"weak_open","name":"Same weak password everywhere, no lockout","servers":[{"name":"srv-0","zone":"zone-a","broken_at":0},{"name":"srv-1","zone":"zone-b","broken_at":0},{"name":"srv-2","zone":"zone-c","broken_at":0},{"name":"srv-3","zone":"zone-a","broken_at":0},{"name":"srv-4","zone":"zone-b","broken_at":0},{"name":"srv-5","zone":"zone-c","broken_at":0}],"broken":6,"guesses":48,"lockouts":0},{"key":"weak_locked","name":"Same weak password everywhere, lockout","servers":[{"name":"srv-0","zone":"zone-a","broken_at":300},{"name":"srv-1","zone":"zone-b","broken_at":300},{"name":"srv-2","zone":"zone-c","broken_at":300},{"name":"srv-3","zone":"zone-a","broken_at":300},{"name":"srv-4","zone":"zone-b","broken_at":300},{"name":"srv-5","zone":"zone-c","broken_at":300}],"broken":6,"guesses":48,"lockouts":6},{"key":"strong","name":"Unique random passwords + policy + lockout","servers":[{"name":"srv-0","zone":"zone-a","broken_at":null},{"name":"srv-1","zone":"zone-b","broken_at":null},{"name":"srv-2","zone":"zone-c","broken_at":null},{"name":"srv-3","zone":"zone-a","broken_at":null},{"name":"srv-4","zone":"zone-b","broken_at":null},{"name":"srv-5","zone":"zone-c","broken_at":null}],"broken":0,"guesses":360,"lockouts":72}]};
+(function renderSecurity() {
+  const section = document.getElementById("security");
+  if (!SECURITY) { section.hidden = true; return; }
+  document.getElementById("sec-sub").textContent =
+    `The attacker tries ${SECURITY.wordlist_size} likely passwords at ${SECURITY.guesses_per_second} guesses per second against each server, for up to an hour. Every setup faces the same attack.`;
+  const body = document.getElementById("sec-body");
+  const when = r => {
+    if (!r.broken) return "Held for the full hour";
+    const t = Math.max(...r.servers.filter(x => x.broken_at !== null).map(x => x.broken_at));
+    return t < 1 ? "Under 1 second" : t < 60 ? `${t} seconds` : `${Math.round(t / 60)} minutes`;
+  };
+  for (const r of SECURITY.setups) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td"); name.textContent = r.name;
+    const chips = document.createElement("td");
+    const wrap = document.createElement("div"); wrap.className = "sec-chips";
+    for (const srv of r.servers) {
+      const chip = document.createElement("span");
+      const broken = srv.broken_at !== null;
+      chip.className = "srv " + (broken ? "broken" : "held");
+      chip.title = broken ? `${srv.name} broken into at ${srv.broken_at} s` : `${srv.name} held`;
+      const mark = document.createElement("b"); mark.textContent = broken ? "✕" : "✓";
+      chip.append(mark, document.createTextNode(srv.name));
+      wrap.append(chip);
+    }
+    chips.append(wrap);
+    const result = document.createElement("td");
+    const p = document.createElement("span"); p.className = "pill"; p.dataset.s = r.broken ? "crit" : "good";
+    p.append(document.createElement("i"), document.createTextNode(`${r.broken} of ${r.servers.length} broken into`));
+    result.append(p);
+    const t = document.createElement("td"); t.textContent = when(r);
+    const g = document.createElement("td"); g.className = "num"; g.textContent = fmtInt(r.guesses);
+    const l = document.createElement("td"); l.className = "num"; l.textContent = fmtInt(r.lockouts);
+    tr.append(name, chips, result, t, g, l);
+    body.append(tr);
+  }
+})();
 
 /* Step cards -------------------------------------------------------------- */
 document.querySelectorAll(".step").forEach((step, idx) => {
